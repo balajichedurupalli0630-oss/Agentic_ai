@@ -122,8 +122,8 @@ python -m venv venv
 source venv/bin/activate  # On Windows: venv\Scripts\activate
 
 # Or using conda
-conda create -n rag-agent python=3.10
-conda activate rag-agent
+conda create -n  Agentic_ai python=3.10
+conda activate Agentic_ai
 ```
 
 ### Step 3: Install Dependencies
