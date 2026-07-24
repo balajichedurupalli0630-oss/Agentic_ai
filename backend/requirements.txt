@@ -1,0 +1,31 @@
+# FastAPI & Server
+fastapi
+uvicorn[standard]
+python-multipart
+slowapi
+
+# LangChain Ecosystem
+langchain
+langchain-core
+langchain-community
+langchain-groq
+langchain-text-splitters
+langgraph
+langgraph-checkpoint
+
+# Vector Store & Embeddings
+chromadb
+sentence-transformers
+
+# Document Loaders
+pymupdf
+
+# BM25 & Reranking
+rank-bm25
+
+# Utilities
+python-dotenv
+pydantic
+numpy
+
+pymupdf4llm

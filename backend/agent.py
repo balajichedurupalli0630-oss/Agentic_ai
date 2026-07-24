@@ -1,120 +1,174 @@
+"""
+agent.py
+
+LangGraph agent with:
+- Conversation summarization (trims old messages when history grows)
+- Summary injected into system prompt for context continuity
+"""
+
 from langgraph.graph import StateGraph, START, END
 from langgraph.prebuilt import ToolNode, tools_condition
-from langchain_core.messages import SystemMessage
+from langchain_core.messages import SystemMessage, RemoveMessage
 from state import AgentState
 from langgraph.checkpoint.memory import MemorySaver
-from llm import get_llm, Ollama_llm, aget_llm_response
+from llm import aget_llm_response, get_fast_llm
 from tools import rag_answer
+from langchain_groq import ChatGroq
+import os
 
-# Initialize components
 memory = MemorySaver()
 tools = [rag_answer]
-llm = get_llm()
+
+# Number of messages before we trigger summarization
+MAX_MESSAGES_BEFORE_SUMMARY = 12
+
+llm = ChatGroq(
+    model="llama-3.3-70b-versatile",
+    temperature=0,
+    groq_api_key=os.environ.get("GROQ_API_KEY"),
+)
 llm_with_tools = llm.bind_tools(tools)
 
-STYLE_SYSTEM = """
-You are an intelligent, reliable, and helpful AI assistant designed to support users with:
-before answering any Query you should check documents first ..
-- Answering questions
-- Explaining concepts
-- Generating and improving code
-- Summarizing and analyzing documents
-- Assisting with learning, problem-solving, and decision-making
+from datetime import datetime
+
+def _build_system_prompt() -> str:
+    now = datetime.now()
+    date_str = now.strftime("%d %B %Y")  # e.g. "26 March 2026"
+    month = now.month
+
+    # Determine academic semester from current month
+    if 1 <= month <= 5:
+        semester_hint = "Even Semester (January – May)"
+    elif 6 <= month <= 7:
+        semester_hint = "between semesters (summer/registration period)"
+    else:
+        semester_hint = "Odd Semester (August – December)"
+
+    return f"""You are a Document Grounded Assistant — reliable and helpful.
+
+Today's date: {date_str}
+Current academic period: {semester_hint}
+
+CRITICAL RULE — MANDATORY TOOL USE:
+- You MUST always call the `rag_answer` tool for any factual questions about college operations, policies, schedules, fees, or events.
+- Never answer a factual question from your pre-trained general knowledge; always retrieve context first.
+
+IMPORTANT — time-aware query handling:
+- When the user says "this ", "current ", "now", "upcoming" — use the
+  current academic period above to interpret which semester they mean.
+- When calling the rag_answer tool, make the query SPECIFIC. Do not pass vague terms
+  like "this semester" — instead pass "Even Semester 2026 holidays" or
+  "Odd Semester 2025 exam schedule" based on context.
+- If retrieved results seem to be from the wrong semester, explicitly note that and
+  clarify which semester the data belongs to.
+
+Response guidelines:
+- Answer directly from retrieved documents
+- If sufficient information found, respond immediately
+- Do NOT make multiple tool calls for the same question
 
 You should:
 - Be clear, concise, and structured
 - Ask clarifying questions when needed
 - Provide step-by-step explanations for complex topics
-- Adapt responses to the user's skill level
 - Prioritize correctness and safety
 
-You have access to:
-- A vector database containing user-uploaded documents
-- Tools for retrieving, searching, and summarizing documents
-- Programming and reasoning capabilities
+If information is not found in documents, clearly state that.
+Never hallucinate document content.
 
-If information is not found in the available documents, rely on general knowledge and clearly state that the answer is based on general knowledge.
-
-Never hallucinate document content. If unsure, say you do not know.
-
-If the user asks about capabilities, tools, or documents, respond using the predefined capability explanation.
-
+Response Style:
+Clear, friendly, and professional. Simple language. Short paragraphs.
 """
 
-# Create tool node - this will ACTUALLY execute the tools
+STYLE_SYSTEM = _build_system_prompt()
+
 tool_node = ToolNode(tools=tools)
 
+
 async def agent_node(state: AgentState):
-    """
-    Simple agent node: Just calls LLM with tools.
-    DOES NOT intercept tool calls - lets ToolNode handle execution.
-    """
+    """Main agent — injects conversation summary and fresh date into system prompt"""
     messages = state["messages"].copy()
 
-    # Add system prompt at the beginning
-    messages.insert(0, SystemMessage(content=STYLE_SYSTEM))
+    # Rebuild prompt each call so the date is always current
+    system_content = _build_system_prompt()
+    summary = state.get("summary", "")
+    if summary:
+        system_content += f"\n\n---\nConversation summary so far:\n{summary}\n---"
 
-    # Call LLM (if it decides to use tools, ToolNode will execute them)
-    response = await aget_llm_response(llm_with_tools, messages)
+    messages.insert(0, SystemMessage(content=system_content))
+    last_msg_content = messages[-1].content if messages else ""
+    print(f"[AGENT START] Invoking LLM with tool bindings... Last message: '{last_msg_content[:80]}...'")
     
-    # Just return the response - if it has tool_calls, 
-    # the graph will route to ToolNode automatically
-    return {"messages": [response]}
+    try:
+        response = await aget_llm_response(llm_with_tools, messages)
+        print(f"[AGENT SUCCESS] LLM responded with: '{response.content[:80]}...' and tool_calls={getattr(response, 'tool_calls', [])}")
+        return {"messages": [response]}
+    except Exception as e:
+        print(f"[AGENT ERROR] LLM generation failed: {e}")
+        raise
 
-async def summary_node(state: AgentState) -> AgentState:
-    """Summarize conversation if it gets too long"""
+
+async def summarize_node(state: AgentState):
+    """
+    Summarize conversation when it exceeds MAX_MESSAGES_BEFORE_SUMMARY.
+    Uses RemoveMessage to trim old messages, preserving the last 4.
+    """
     messages = state["messages"]
-    
-    # Only summarize if we have many messages (optional optimization)
-    if len(messages) < 10:
+
+    if len(messages) <= MAX_MESSAGES_BEFORE_SUMMARY:
+        return {}  # Nothing to do
+
+    existing_summary = state.get("summary") or ""
+    messages_to_summarize = messages[:-4]   # All except last 4
+    recent_messages = messages[-4:]          # Keep these
+
+    prior = f"Prior summary:\n{existing_summary}\n\n" if existing_summary else ""
+    history_text = "\n".join(
+        f"{getattr(m, 'type', 'msg').upper()}: {getattr(m, 'content', str(m))}"
+        for m in messages_to_summarize
+    )
+
+    summary_prompt = (
+        f"{prior}"
+        f"Summarize the following conversation turns concisely. "
+        f"Capture key topics, questions asked, and answers given.\n\n"
+        f"{history_text}\n\n"
+        f"Concise summary:"
+    )
+
+    fast_llm = get_fast_llm()
+    try:
+        response = await fast_llm.ainvoke(summary_prompt)
+        new_summary = response.content.strip()
+    except Exception as e:
+        print(f"[SUMMARIZE] Failed: {e}")
         return {}
-    
-    summary_prompt = [
-        SystemMessage(
-            content=(
-                "Summarize the conversation so far. "
-                "Preserve the important details and user's intent clearly."
-            )
-        ),
-        *messages
-    ]
-    
-    llm1 = Ollama_llm()
-    summary_response = await aget_llm_response(llm1, summary_prompt)
-    summary = summary_response.content
-    
-    # Keep last 4 messages + summary
+
+    # Delete old messages from state (LangGraph RemoveMessage pattern)
+    delete_ops = [RemoveMessage(id=m.id) for m in messages_to_summarize]
+
+    print(f"[SUMMARIZE] Trimmed {len(messages_to_summarize)} messages. New summary length: {len(new_summary)}")
     return {
-        "messages": messages[-4:],
-        "summary": summary
+        "messages": delete_ops,
+        "summary": new_summary,
     }
 
+
 def build_agent():
-    # Create graph
+    """Build LangGraph agent with summarization"""
     builder = StateGraph(AgentState)
-    
-    # Add nodes
+
     builder.add_node("agent", agent_node)
     builder.add_node("tools", tool_node)
-    builder.add_node("summary", summary_node)
-    
-    # Define edges
+    builder.add_node("summarize", summarize_node)
+
     builder.add_edge(START, "agent")
-    
-    # Conditional: if tool_calls exist -> go to tools, else -> end
     builder.add_conditional_edges(
         "agent",
-        tools_condition,  # Built-in: returns "tools" if tool_calls present, else END
-        {
-            "tools": "tools",
-            END: END
-        }
+        tools_condition,
+        {"tools": "tools", END: "summarize"}  # always pass through summarize
     )
-    
-    # After tools execute, return to agent to process results
     builder.add_edge("tools", "agent")
-    
-    # Optional: Add summarization logic if needed
-    # For now, we keep it simple: agent -> END or agent -> tools -> agent -> END
-    
+    builder.add_edge("summarize", END)
+
     return builder.compile(checkpointer=memory)
