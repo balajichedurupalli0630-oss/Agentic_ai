@@ -1,89 +1,111 @@
 """
-tools.py - FIXED for Groq compatibility
+tools.py
+
+Groq-compatible RAG & Web Search tools with adaptive retrieval and Self-RAG query refinement.
 """
 
 from langchain_core.tools import tool
 from pydantic import BaseModel, Field
+from logger import get_logger
+from rag_advanced import (
+    classify_query_intent,
+    grade_retrieved_context,
+    refine_query_for_retrieval,
+    format_citations_context,
+)
+
+logger = get_logger(__name__)
 
 _retrieval_system = None
 
 
 def set_retrieval_system(system):
-    """Wire retrieval system into tool"""
+    """Wire retrieval system singleton into tool module."""
     global _retrieval_system
     _retrieval_system = system
 
 
-# Define input schema explicitly for Groq
 class RAGInput(BaseModel):
-    """Input for the RAG answer tool"""
+    """Input schema for the RAG answer tool."""
     query: str = Field(description="The question to search for in documents")
+
+
+class WebSearchInput(BaseModel):
+    """Input schema for live web search."""
+    query: str = Field(description="The query for live web search")
 
 
 @tool(args_schema=RAGInput)
 async def rag_answer(query: str) -> str:
     """
-    Search documents and retrieve information to answer questions.
-    Use this tool to find relevant information from uploaded documents.
+    Search indexed documents and retrieve relevant information with source citations.
+    Use this tool to answer factual questions from uploaded documents.
     """
-    print(f"[TOOL START] rag_answer tool invoked with query: '{query}'")
+    logger.info(f"rag_answer tool invoked with query: '{query}'")
     if _retrieval_system is None:
-        print("[TOOL ERROR] Retrieval system is not initialized.")
+        logger.error("Retrieval system is not initialized.")
         return "ERROR: Retrieval system not initialized."
 
     try:
-        # Retrieve with cross-encoder reranking
+        # 1. Query-Adaptive Intent Classification
+        route = await classify_query_intent(query)
+        strategy = route.get("strategy", "precise")
+        top_k = 12 if strategy == "synthesis" else 5
+
+        # 2. Initial Retrieval
         docs = await _retrieval_system.retrieve(
             query=query,
-            top_k=5,
+            top_k=top_k,
             use_hybrid=True,
             use_reranking=True
         )
 
-        if not docs:
-            print("[TOOL WARNING] No relevant documents found from retrieval.")
+        formatted_context = format_citations_context(docs) if docs else ""
+
+        # 3. Self-RAG Context Grading & CRAG Query Refinement
+        is_sufficient = await grade_retrieved_context(query, formatted_context)
+        if not is_sufficient:
+            logger.info(f"Initial context graded insufficient for '{query}'. Initiating CRAG query refinement...")
+            refined_q = await refine_query_for_retrieval(query)
+
+            re_docs = await _retrieval_system.retrieve(
+                query=refined_q,
+                top_k=top_k,
+                use_hybrid=True,
+                use_reranking=True
+            )
+
+            if re_docs:
+                docs = re_docs
+                formatted_context = format_citations_context(docs)
+
+        if not docs or not formatted_context:
+            logger.warning(f"No relevant document chunks found for query: '{query}'")
             return "No relevant documents found to answer this question."
 
-        # Format results
-        MAX_TOTAL_CHARS = 6000
-        MAX_DOC_CHARS = 1500
-        
-        docs = sorted(
-            docs,
-            key=lambda x: x.get("final_score", 
-                               x.get("combined_score", 
-                                    x.get("similarity_score", 0))),
-            reverse=True
-        )
-        
-        parts = []
-        total = 0
-        
-        for i, doc in enumerate(docs[:5], 1):
-            score = doc.get("final_score", doc.get("combined_score", 0))
-            content = doc["content"][:MAX_DOC_CHARS]
-            meta = doc.get("metadata", {}) or {}
-            content_type = meta.get("content_type", "unknown")
-            entry = f"[Doc {i} | Score: {score:.3f} | Type: {content_type}]\n{content}"
-            
-            if total + len(entry) > MAX_TOTAL_CHARS:
-                break
-            
-            parts.append(entry)
-            total += len(entry)
-
-        context = "\n\n---\n".join(parts)
-        print(f"[TOOL] Returning context ({len(context)} chars from {len(parts)} docs)")
-        print("[TOOL] Retrieved documents detailed summary:")
-        for idx, doc in enumerate(docs[:5], 1):
-            meta = doc.get("metadata", {}) or {}
-            c_type = meta.get("content_type", "unknown")
-            score = doc.get("final_score", doc.get("combined_score", 0))
-            print(f"  - Doc {idx}: score={score:.3f}, type={c_type}")
-        return context
+        logger.info(f"Returning formatted citations context ({len(formatted_context)} chars from {len(docs)} chunks)")
+        return formatted_context
 
     except Exception as e:
-        import traceback
-        print(f"[ERROR] rag_answer: {e}")
-        traceback.print_exc()
+        logger.error(f"Error in rag_answer tool: {e}", exc_info=True)
         return f"ERROR: {str(e)}"
+
+
+@tool(args_schema=WebSearchInput)
+async def web_search(query: str) -> str:
+    """
+    Search the live web for current events, breaking updates, or time-sensitive information.
+    Use this tool when information is not found in documents or requires live internet data.
+    """
+    logger.info(f"web_search tool invoked with query: '{query}'")
+    try:
+        from langchain_community.tools import DuckDuckGoSearchRun
+        ddg = DuckDuckGoSearchRun()
+        results = ddg.run(query)
+        if not results:
+            return "No live web results found for this query."
+        logger.info(f"Web search returned {len(results)} chars")
+        return f"[Live Web Search Results]\n{results[:3000]}"
+    except Exception as e:
+        logger.error(f"Web search failed ({e})", exc_info=True)
+        return f"Live web search failed: {str(e)}"

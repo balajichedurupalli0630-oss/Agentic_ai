@@ -8,6 +8,9 @@ from typing import List, Any
 from pathlib import Path
 import chromadb
 import numpy as np
+import dotenv
+
+dotenv.load_dotenv()
 
 
 class VectorStore:

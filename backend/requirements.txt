@@ -20,12 +20,25 @@ sentence-transformers
 # Document Loaders
 pymupdf
 
-# BM25 & Reranking
+# Observability & Metrics
+prometheus-client
+
 rank-bm25
+duckduckgo-search
+
+
+# Database & Persistence
+sqlalchemy
+alembic
+psycopg[binary]
+langgraph-checkpoint-postgres
 
 # Utilities
 python-dotenv
 pydantic
+pydantic-settings
 numpy
 
 pymupdf4llm
+
+

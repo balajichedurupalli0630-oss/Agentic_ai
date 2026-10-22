@@ -1,3 +1,6 @@
+import dotenv
+dotenv.load_dotenv()
+
 from embeddings import embedding_loader
 from vector_base import vectorstore
 from doc_load_chunk import split_documents, load_documents
